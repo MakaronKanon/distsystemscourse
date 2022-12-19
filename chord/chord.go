@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -63,18 +64,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("Hello world", *ipHost, *portHost)
+	currentNode = createOurNode(*ipHost, *portHost)
+	shouldJoin := *otherPort != -1
+	if shouldJoin {
+		joinRing(*otherHost, *otherPort)
+	} else {
+		createRing()
+	}
 
-	createRing(*ipHost, *portHost)
 	go listenForConnections(*ipHost, *portHost)
 
-	go stabilize(*timeBetweenStabilize)
+	go runInterval(*timeBetweenStabilize, stabilize)
+	go runInterval(*timeBetweenCheckPredecessors, checkPredecessor)
+
 	// go fixFingers()
-	// go checkPredecessor()
 
-	// Continuosly read commands.
 	readCommands()
-
 }
 
 type node struct {
@@ -93,48 +98,59 @@ var successor node
 var currentNode node
 var predecessor *node
 
-func createRing(ip string, port int) {
-	predecessor = nil
-	successor = createNode(fmt.Sprintf("%s:%d", ip, port))
-	currentNode = successor
+func createOurNode(ip string, port int) node {
+	return createNode(fmt.Sprintf("%s:%d", ip, port))
 }
 
-func joinRing() { // otherNode) {
-	// predecessor = nil
-	// successor = otherNode.findSuccessor(currentNodeId)
+func createRing() {
+	successor = currentNode
 }
 
-func stabilize(interval int) {
-	for {
-		x := nodeInterface.GetPredeccessor(successor)
+func joinRing(ip string, port int) {
+	otherNode := createNode(fmt.Sprintf("%s:%d", ip, port))
 
-		fmt.Println("Stabilizing x is ", x)
-		if isBetween(x, currentNode, successor) {
-			successor = x
-		}
-		nodeInterface.Notify(successor)
+	// TODO: Can we assume this will succeed?
+	successor = findSuccessorIteratively(currentNode.id, otherNode)
+}
 
-		time.Sleep(interval) // int(time.Second) * interval)
-	}
+func sleepMilliSeconds(seconds int) {
+	time.Sleep(time.Duration(seconds) * time.Millisecond)
 }
 
 // Other node notify us of their existance.
-func notify(node node) {
+func notify(potentialPredecessor node) {
 	if predecessor == nil {
 		// We don't have anything better as predecessor so use it.
-		predecessor = &node
+		predecessor = &potentialPredecessor
 		return
 	}
-	if isBetween(node, *predecessor, currentNode) {
-		predecessor = &node
+
+	if isBetween(predecessor.id, potentialPredecessor.id, currentNode.id) {
+		predecessor = &potentialPredecessor
 	}
-
 }
 
-// Whether x is in range (y, z) in the circle.
-func isBetween(x node, y node, z node) bool {
-	return false
+// Whether middle is in range (y, z)
+func isBetween(x id, middle id, z id) bool {
+	if x.Cmp(z) == -1 {
+		// x ---- middle ---- z
+		// x < middle && middle < z
+		return (x.Cmp(middle) == -1) && middle.Cmp(z) == -1
+	} else {
+		// middle ---- z ---- x ---- middle
+		// middle < z || x < middle
+		return (middle.Cmp(z) == -1 || x.Cmp(middle) == -1)
+	}
 }
+
+// func isBetween(x node, y node, z node) bool {
+// 	 if y.id.Cmp(z.id) == -1 {
+// 	 	return (x.id.Cmp(y.id) == 1 || x.id.Cmp(y.id) == 0) && x.id.Cmp(z.id) == -1
+// 	 } else { // Other case.
+// 	 	return (x.id.Cmp(y.id) == 1 || x.id.Cmp(y.id) == 0) || x.id.Cmp(z.id) == -1
+// 	 }
+// 	return false
+// }
 
 func fixFingers() {
 	for {
@@ -148,25 +164,35 @@ func fixFingers() {
 
 }
 
-func checkPredecessor() {
+func runInterval(interval int, function func()) {
 	for {
-		fmt.Println("Checking predecessor")
+		sleepMilliSeconds(interval)
+		function()
+	}
+}
 
-		// if *redecessor = nil {
-		// 	return
-		// }
-		// isAlive := predecessor.ping()
-		// if !isAlive {
-		// 	predecessor = nil
-		// }
+func checkPredecessor() {
+	fmt.Println("Checking predecessor")
 
-		// text, _ := reader.ReadString('\n');
-
-		//
-
-		time.Sleep(time.Second)
+	if predecessor == nil {
+		return
 	}
 
+	isAlive := nodeInterface.Ping(*predecessor)
+	if !isAlive {
+		predecessor = nil
+	}
+}
+
+func stabilize() {
+	fmt.Println("Running stabilize")
+
+	potentialNewSuccessor, exists := nodeInterface.GetPredeccessor(successor)
+
+	if exists && isBetween(currentNode.id, potentialNewSuccessor.id, successor.id) {
+		successor = potentialNewSuccessor
+	}
+	nodeInterface.Notify(successor)
 }
 
 func readCommands() {
@@ -204,8 +230,12 @@ type HttpNodeInterface struct{}
 
 func (h HttpNodeInterface) Ping(node node) bool {
 	resp, err := http.Get("http://" + node.address + "/ping")
-	if err != nil || resp.StatusCode != 200 {
-		fmt.Println("Error pinging : ", err.Error())
+	if err != nil {
+		log.Println("Error pinging : ", err.Error())
+		return false
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Println("Not alive")
 		return false
 	}
 	return true
@@ -217,13 +247,14 @@ type FindSuccessorHttpResponse struct {
 }
 
 func (h HttpNodeInterface) FindSuccessor(node node, id id) (bool, node) {
+	fmt.Println("Make FindSucessor call to ", node)
 	resp, err := http.Get("http://" + node.address + "/findSuccessor?id=" + id.String())
-	fmt.Println("Before parse response is ", resp.Body)
-	if err != nil || resp.StatusCode != 200 {
-		fmt.Println("Error finding successor : ", err.Error())
-
-		panic("Panic")
+	if err != nil {
+		log.Panic("Error finding successor: ", err.Error())
+	} else if resp.StatusCode != http.StatusOK {
+		log.Panic("Error finding successor, status not ok.")
 	}
+
 	var parsedResp FindSuccessorHttpResponse
 	err = json.NewDecoder(resp.Body).Decode(&parsedResp)
 	fmt.Println("Parsed the response to ", parsedResp)
@@ -235,42 +266,38 @@ func (h HttpNodeInterface) FindSuccessor(node node, id id) (bool, node) {
 }
 
 type GetPredeccessorHttpResponse struct {
-	address string
+	Address        string `json:"address"`
+	HasPredecessor bool   `json:"hasPredecessor"`
 }
 
-func (HttpNodeInterface) GetPredeccessor(node node) node {
+func (HttpNodeInterface) GetPredeccessor(node node) (node, bool) {
 	resp, err := http.Get("http://" + node.address + "/getPredeccessor")
-	if err != nil || resp.StatusCode != 200 {
-		fmt.Println("Error finding predeccessor : ", err.Error())
-		return createNode("bad")
+	if err != nil {
+		log.Panic("Error asking predecessor: ", err.Error())
 	}
-	fmt.Println("Before parse response is ", resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Panic("Error asking predecessor, status not ok.")
+	}
+
 	var parsedResp GetPredeccessorHttpResponse
 	err = json.NewDecoder(resp.Body).Decode(&parsedResp)
-	fmt.Println("Parsed the response to ", parsedResp)
 	if err != nil {
-		panic(err)
+		log.Panic("Error decoding predecessor response ", err.Error())
 	}
-	return createNode(parsedResp.address)
+
+	return createNode(parsedResp.Address), parsedResp.HasPredecessor
 }
 
 func (HttpNodeInterface) Notify(node node) {
 	resp, err := http.Get("http://" + node.address + "/notify?address=" + currentNode.address)
-	fmt.Println("Before parse response is ", resp.Body)
-	if err != nil || resp.StatusCode != 200 {
-		fmt.Println("Error finding successor : ", err.Error())
 
-		panic("Panic")
+	if err != nil {
+		log.Panic("Error notifying node: ", node, err.Error())
 	}
 
-	// var parsedResp NotifyHttpResponse
-	// err = json.NewDecoder(resp.Body).Decode(&parsedResp)
-	// fmt.Println("Parsed the response to ", parsedResp)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// return parsedResp.FoundSuccessor, createNode(parsedResp.SuccessorAdress)
-
+	if resp.StatusCode != 200 {
+		log.Panic("Bad resposne notifying: ", node)
+	}
 }
 
 var nodeInterface = HttpNodeInterface{}
@@ -283,7 +310,7 @@ func pingSuccessor() {
 func lookupFile(filename string) {
 	id := getId(filename)
 
-	owner := findSuccessorIteratively(id)
+	owner := findSuccessorIteratively(id, currentNode)
 
 	// file := nodeInterface.RequestFile(owner, filename)
 
@@ -297,40 +324,7 @@ func lookupFile(filename string) {
 
 // Find whether id is in range [currentNode.id, successor.id).
 func ownerOfIdIsSuccessor(id id) bool {
-	// Find whether y is in range [x, x), only true if y = x.
-	fmt.Println(id)
-	fmt.Println(currentNode.id)
-	fmt.Println(successor.id)
-
-	// ALGORITM BARA PSEUDOKODDDDDDDD. Whether this node's successor is the owner of id.
-	// EXEMPEL:
-	// currentNode = 5, successorNode = 8, id = 6 => true
-	// currentNode = 5, successorNode = 8, id = 4 => false
-	// currentNode = 5, successorNode = 8, id = 9 => false
-	// currentNode = 5, successorNode = 8, id = 5 => true
-	// currentNode = 5, successorNode = 8, id = 8 => false
-	// efter (ink) 5 och innan 8
-	// id >= currentNode.id && id < successorNode.id
-	// Case 1 is only if currentNode < successorNode
-	if currentNode.id.Cmp(successor.id) == -1 {
-		return (id.Cmp(currentNode.id) == 1 || id.Cmp(currentNode.id) == 0) && id.Cmp(successor.id) == -1
-	} else { // Other case.
-		return (id.Cmp(currentNode.id) == 1 || id.Cmp(currentNode.id) == 0) || id.Cmp(successor.id) == -1
-	}
-	//
-	// currentNode = 8, successorNode = 5, id = 6 => false
-	// currentNode = 8, successorNode = 5, id = 4 => true
-	// currentNode = 8, successorNode = 5, id = 9 => true
-	// efter (ink) 8 eller innan 5
-	// id >= currentNode.id || id < successorNode.id
-	//
-	// currentNode = 5, successorNode = 5, id = 5 => true
-	// currentNode = 5, successorNode = 5, id = 3 => true
-	// currentNode = 5, successorNode = 5, id = 8 => true
-	// efter (ink) 5 eller innan 5
-	// id >= currentNode.id || id < successorNode.id
-
-	// return (id.Cmp(currentNode.id) == 1 || id.Cmp(currentNode.id) == 0) && id.Cmp(successor.id) == -1
+	return isBetween(currentNode.id, id, successor.id) || currentNode.id.Cmp(id) == 0
 }
 
 // Find the node responsable for storing `id`.
@@ -341,8 +335,8 @@ func findSuccessor(id id) (bool, node) {
 	return false, successor
 }
 
-func findSuccessorIteratively(id *big.Int) node {
-	nextNode := currentNode
+func findSuccessorIteratively(id *big.Int, startNode node) node {
+	nextNode := startNode
 	for {
 		println("Looping finding successor iteratively")
 		found, nextNode := nodeInterface.FindSuccessor(nextNode, id)
@@ -355,7 +349,7 @@ func findSuccessorIteratively(id *big.Int) node {
 func storeFile(filename string) {
 	id := getId(filename)
 
-	owner := findSuccessorIteratively(id)
+	owner := findSuccessorIteratively(id, currentNode)
 
 	// file := nodeInterface.RequestFile(owner, filename)
 
@@ -384,7 +378,9 @@ func hash(elt string) *big.Int {
 }
 
 func printState() {
-	fmt.Println("Printing state")
+	// fmt.Println("Printing state")
+	fmt.Println("Successor is ", successor)
+	fmt.Println("Predeccessor is ", predecessor)
 }
 
 func listenForConnections(host string, port int) {
@@ -404,6 +400,7 @@ func listenForConnections(host string, port int) {
 }
 
 func handlePing(w http.ResponseWriter, req *http.Request) {
+	log.Println("Got a ping request, responding with pong.")
 	w.WriteHeader(200)
 }
 
@@ -448,84 +445,32 @@ func handleFindSuccessor(w http.ResponseWriter, req *http.Request) {
 
 func handleGetPredeccessor(w http.ResponseWriter, req *http.Request) {
 	fmt.Println("Handling get predeccessor")
-	// id := req.URL.Query().Get("id")
-	// fmt.Println("Handling find successor, id is ", id)
 
-	// var successorHttpRequest FindSucessorHttpRequest
-	// err := json.NewDecoder(req.Body).Decode(&successorHttpRequest)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// String to bigint?
-	// n := new(big.Int)
-	// n, ok := n.SetString(id, 10)
-	// if !ok {
-	// 	panic("Not ok")
-	// }
-
-	fmt.Println("Before")
-
-	fmt.Println("After")
 	var response GetPredeccessorHttpResponse
 	if predecessor != nil {
 		response = GetPredeccessorHttpResponse{
-			address: predecessor.address,
+			Address:        predecessor.address,
+			HasPredecessor: true,
 		}
 	} else {
-		response = GetPredeccessorHttpResponse{}
+		response = GetPredeccessorHttpResponse{
+			HasPredecessor: false,
+		}
 	}
-	fmt.Println("Response is ", response)
-
 	err := json.NewEncoder(w).Encode(response)
+
 	if err != nil {
-		panic(err)
-	} else {
-		fmt.Println("No error")
+		log.Panic("Failed to encode response ", response, err)
 	}
 }
 
 func handleNotify(w http.ResponseWriter, req *http.Request) {
 	fmt.Println("Handling notify")
-	// id := req.URL.Query().Get("id")
-	// fmt.Println("Handling find successor, id is ", id)
 
-	// var successorHttpRequest FindSucessorHttpRequest
-	// err := json.NewDecoder(req.Body).Decode(&successorHttpRequest)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// String to bigint?
-	// n := new(big.Int)
-	// n, ok := n.SetString(id, 10)
-	// if !ok {
-	// 	panic("Not ok")
-	// }
-
-	// Parse the address.
-	address := "todo"
-	node := createNode(address)
-	notify(node)
+	notifierAddress := req.URL.Query()["address"][0]
+	log.Println("Parsed handleNotify address ", notifierAddress)
+	notifierNode := createNode(notifierAddress)
+	notify(notifierNode)
 
 	w.WriteHeader(200)
-	// fmt.Println("Before")
-
-	// fmt.Println("After")
-	// var response GetPredeccessorHttpResponse
-	// if predecessor != nil {
-	// 	response = GetPredeccessorHttpResponse{
-	// 		address: predecessor.address,
-	// 	}
-	// } else {
-	// 	response = GetPredeccessorHttpResponse{}
-	// }
-	// fmt.Println("Response is ", response)
-
-	// err := json.NewEncoder(w).Encode(response)
-	// if err != nil {
-	// 	panic(err)
-	// } else {
-	// 	fmt.Println("No error")
-	// }
 }
