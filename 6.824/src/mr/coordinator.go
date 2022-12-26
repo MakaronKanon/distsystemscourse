@@ -19,9 +19,10 @@ const (
 )
 
 type Coordinator struct {
-	stage           Stage
+	stage Stage
+
 	tasks           []Task
-	tasksInProgress map[int]Task
+	tasksInProgress map[int]*Task // Key is task id.
 	tasksTodo       []Task
 
 	mutex sync.Mutex
@@ -41,27 +42,19 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 	defer c.mutex.Unlock()
 
 	if len(c.tasksTodo) > 0 {
-		if c.stage == STAGE_MAP {
-			reply.TaskType = TASK_MAP
-		} else {
-			reply.TaskType = TASK_REDUCE
-		}
-		reply.Task = c.tasksTodo[len(c.tasksTodo)-1]
+		task := c.tasksTodo[len(c.tasksTodo)-1]
 		c.tasksTodo = c.tasksTodo[:len(c.tasksTodo)-1]
-		log.Println("Assigned new task ", reply.Task.Id)
-		reply.Task.startedAt = time.Now()
-		c.tasksInProgress[reply.Task.Id] = reply.Task
+
+		log.Println("Assigned new task ", task.Id)
+		c.assignTaskAsReply(&task, reply)
+		c.tasksInProgress[task.Id] = &task
+
 	} else if len(c.tasksInProgress) > 0 {
 		for _, task := range c.tasksInProgress {
 			if time.Now().Sub(task.startedAt) > 10*time.Second {
 				log.Println("Reassinging task ", task.Id)
-				if c.stage == STAGE_MAP {
-					reply.TaskType = TASK_MAP
-				} else {
-					reply.TaskType = TASK_REDUCE
-				}
-				reply.Task = task
-				reply.Task.startedAt = time.Now()
+
+				c.assignTaskAsReply(task, reply)
 				return nil
 			}
 		}
@@ -72,6 +65,17 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 	}
 
 	return nil
+}
+
+func (c *Coordinator) assignTaskAsReply(task *Task, reply *AskForTaskReply) {
+	if c.stage == STAGE_MAP {
+		reply.TaskType = TASK_MAP
+	} else {
+		reply.TaskType = TASK_REDUCE
+	}
+	reply.Task = *task
+
+	task.startedAt = time.Now()
 }
 
 func (c *Coordinator) TaskFinished(args *TaskFinishedArgs, reply *TaskFinishedReply) error {
@@ -163,7 +167,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 	c.tasksTodo = make([]Task, len(files))
 	copy(c.tasksTodo, c.tasks)
-	c.tasksInProgress = make(map[int]Task)
+	c.tasksInProgress = make(map[int]*Task)
 
 	c.numReducers = nReduce
 
