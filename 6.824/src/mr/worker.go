@@ -24,23 +24,16 @@ type WorkerData struct {
 	numReducers int
 }
 
-//
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// func (worker *WorkerData) getBucketNumber(key string) int {
-// 	return
-// }
+func (worker *WorkerData) getBucketNumber(key string) int {
+	return ihash(key) % worker.numReducers
+}
 
-//
-// main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -54,7 +47,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	log.Println("Worker ready, starting to ask for tasks.")
 	for {
-		shouldQuit := fetchTask(&worker)
+		shouldQuit := worker.runTask()
 		if shouldQuit {
 			log.Println("Worker quitting!")
 			break
@@ -62,12 +55,13 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 }
 
-func fetchTask(worker *WorkerData) bool {
+func (worker *WorkerData) runTask() bool {
 	reply, ok := AskForTask()
 
 	if !ok {
 		return true
 	}
+
 	// if rand.Intn(100) < 20 {
 	// 	log.Println("Task simulating slowness, taskid: ", reply.Task.Id)
 	// 	time.Sleep(12 * time.Second)
@@ -97,13 +91,7 @@ func (worker *WorkerData) mapFile(task Task) {
 	content := readFileContent(task.Filename)
 	result := worker.mapFunction(task.Filename, content)
 
-	// Divide the result into buckets.
-	buckets := make([][]KeyValue, worker.numReducers)
-
-	for _, item := range result {
-		bucketIndex := ihash(item.Key) % worker.numReducers
-		buckets[bucketIndex] = append(buckets[bucketIndex], item)
-	}
+	buckets := worker.divideIntermediateResultToBuckets(result)
 
 	for bucket, bucketContent := range buckets {
 		writeIntermediateFile(task.Id, bucket, bucketContent)
@@ -116,35 +104,46 @@ func (worker *WorkerData) mapFile(task Task) {
 
 func (worker *WorkerData) runReduce(task Task) {
 	bucket := task.Id
-	values := make(map[string][]string)
 
-	for task := 0; task < worker.numTasks; task++ {
-		keyValues := readIntermediateFile(task, bucket)
+	groupedValues := worker.groupIntermediateKeys(bucket)
+	finalKeyValues := worker.applyReduceFunction(groupedValues)
 
-		for _, keyValue := range keyValues {
-			if _, exists := values[keyValue.Key]; !exists {
-				values[keyValue.Key] = make([]string, 0)
-			}
-			values[keyValue.Key] = append(values[keyValue.Key], keyValue.Value)
-		}
-	}
-
-	result := make([]KeyValue, 0)
-	for key, value := range values {
-		reducedValue := worker.reduceFunction(key, value)
-		result = append(result, KeyValue{
-			Key:   key,
-			Value: reducedValue,
-		})
-	}
-
-	writeOutputFile(bucket, result)
+	writeOutputFile(bucket, finalKeyValues)
 
 	// removeIntermediateFiles(bucket, worker.numTasks)
 
 	if ok := NotifyTaskFinished(task); !ok {
 		log.Println("Could not notify task was finished.")
 	}
+}
+
+func (worker *WorkerData) groupIntermediateKeys(bucket int) map[string][]string {
+	groupedValues := make(map[string][]string)
+
+	for task := 0; task < worker.numTasks; task++ {
+		keyValues := readIntermediateFile(task, bucket)
+
+		for _, keyValue := range keyValues {
+			if _, exists := groupedValues[keyValue.Key]; !exists {
+				groupedValues[keyValue.Key] = make([]string, 0)
+			}
+			groupedValues[keyValue.Key] = append(groupedValues[keyValue.Key], keyValue.Value)
+		}
+	}
+	return groupedValues
+}
+
+func (worker *WorkerData) applyReduceFunction(groupedValues map[string][]string) []KeyValue {
+	result := make([]KeyValue, 0)
+	for key, value := range groupedValues {
+		reducedValue := worker.reduceFunction(key, value)
+		result = append(result, KeyValue{
+			Key:   key,
+			Value: reducedValue,
+		})
+	}
+	return result
+
 }
 
 func getIntermediateFilename(task int, bucket int) string {
@@ -184,13 +183,23 @@ func writeIntermediateFile(task int, bucket int, bucketContent []KeyValue) {
 	}
 }
 
+func (worker *WorkerData) divideIntermediateResultToBuckets(result []KeyValue) [][]KeyValue {
+	buckets := make([][]KeyValue, worker.numReducers)
+
+	for _, item := range result {
+		bucketIndex := worker.getBucketNumber(item.Key)
+		buckets[bucketIndex] = append(buckets[bucketIndex], item)
+	}
+	return buckets
+}
+
 // func removeIntermediateFiles(bucket int, numTasks int) {
 // 	for i := 0; i < numTasks; i++ {
 // 		os.Remove(getIntermediateFilename(i, bucket))
 // 	}
 // }
 
-func writeOutputFile(bucket int, content []KeyValue) {
+func writeOutputFile(bucket int, keyValues []KeyValue) {
 	filename := getOutputFilename(bucket)
 
 	// if _, err := os.Stat(filename); err == nil {
@@ -204,7 +213,7 @@ func writeOutputFile(bucket int, content []KeyValue) {
 		log.Fatalf("Failed to create output file `%s` due to `%s`", filename, err)
 	}
 
-	for _, keyValue := range content {
+	for _, keyValue := range keyValues {
 		_, err := fmt.Fprintf(file, "%v %v\n", keyValue.Key, keyValue.Value)
 		if err != nil {
 			log.Fatalf("Failed to write keyValue to output file `%s` due to `%s`", filename, err)
