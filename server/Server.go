@@ -8,9 +8,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"time"
 )
 
-const MAX_GOROUTINES = 10
+const MAX_GOROUTINES = 10 // 2
 
 var semaphore = make(chan struct{}, MAX_GOROUTINES)
 
@@ -37,6 +38,7 @@ func handleClient(w http.ResponseWriter, req *http.Request) {
 	}()
 	semaphore <- struct{}{}
 
+	// time.Sleep(time.Second * 10)
 	println("Trying to access ", req.URL.Path)
 	res := filepath.Ext(req.URL.Path)
 	file := req.URL.Path
